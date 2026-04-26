@@ -16,14 +16,20 @@ admin console.
 
 ```
 .
-├── index.json                 # lists the official manifests
+├── index.json                       # lists the official manifests
 ├── manifests/
 │   ├── starter.yaml
 │   ├── complete.yaml
 │   ├── medical.yaml
 │   └── education.yaml
-├── LICENSE                    # MIT-0
-└── README.md                  # this file
+├── tools/
+│   ├── bundles-validate             # standalone CLI validator
+│   ├── bundles_schema.py            # vendored from the appliance
+│   ├── sync-schema.sh               # re-vendor helper
+│   └── tests/                       # validator unit tests
+├── .github/workflows/validate.yml   # CI: runs the validator on every PR
+├── LICENSE                          # MIT-0
+└── README.md                        # this file
 ```
 
 ## index.json
