@@ -1,0 +1,25 @@
+name: validate
+
+on:
+  pull_request:
+    paths:
+      - 'manifests/**'
+      - 'index.json'
+      - 'tools/**'
+      - '.github/workflows/validate.yml'
+  push:
+    branches: [main]
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install pyyaml
+      - name: Schema-validate manifests
+        run: python3 tools/bundles-validate manifests/ index.json
+      - name: Run validator unit tests
+        run: python3 -m unittest discover -s tools/tests

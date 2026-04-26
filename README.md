@@ -183,11 +183,54 @@ the official ones, namespaced as `<your-source-id>:<bundle-id>`.
 
 The appliance JSON-schema-validates manifests at install time and
 surfaces a specific error for each problem. To pre-flight your bundle
-locally:
+locally, this repo ships a standalone validator under `tools/`:
 
 ```bash
-# Coming soon — a `prepperpi-bundles validate` CLI bundled with the
-# appliance, plus a GitHub Action you can drop into your bundle repo.
+# Schema check (offline, no network):
+python3 tools/bundles-validate manifests/
+
+# Validate the index entry-point + every manifest it points at:
+python3 tools/bundles-validate manifests/ index.json
+
+# Resolution check against a Kiwix catalog + regions snapshot
+# (catches retired ZIM book_ids and unknown map regions):
+python3 tools/bundles-validate \
+    --catalog kiwix-catalog.json \
+    --regions regions.json \
+    manifests/
+```
+
+Exit codes: `0` clean, `1` at least one failure, `2` usage error.
+
+The validator depends only on `pyyaml` plus the Python stdlib. It uses
+the appliance's actual schema parser, vendored as
+`tools/bundles_schema.py`; refresh it from a local prepperpi checkout
+with `tools/sync-schema.sh` whenever the appliance schema changes.
+
+### CI for community bundle repos
+
+If you're hosting your own bundle source in a Git repo, copy
+`tools/` and `.github/workflows/validate.yml` from this repo, and the
+exact same checks will run on every PR. Minimal workflow snippet:
+
+```yaml
+name: validate
+on:
+  pull_request:
+    paths: ['manifests/**', 'index.json', 'tools/**']
+  push:
+    branches: [main]
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
+      - run: pip install pyyaml
+      - run: python3 tools/bundles-validate manifests/ index.json
+      - run: python3 -m unittest discover -s tools/tests
 ```
 
 ## Submitting to the official bundles

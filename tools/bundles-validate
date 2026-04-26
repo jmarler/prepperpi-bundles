@@ -1,0 +1,268 @@
+#!/usr/bin/env python3
+"""bundles-validate — pre-flight a bundle manifest against the appliance schema.
+
+Wraps the vendored bundles_schema.py so bundle authors can catch typos
+and schema drift in CI before pushing manifests live.
+
+    python3 tools/bundles-validate manifests/                # schema-only
+    python3 tools/bundles-validate manifests/ index.json
+    python3 tools/bundles-validate \\
+        --catalog kiwix-catalog.json \\
+        --regions regions.json \\
+        manifests/
+
+Exit codes: 0 = all clean, 1 = at least one failure, 2 = usage error.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+from pathlib import Path
+from typing import Iterable
+from urllib.parse import urlparse
+
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+
+import bundles_schema  # noqa: E402  (deliberate after sys.path insert)
+
+
+MANIFEST_SUFFIXES = (".yaml", ".yml")
+
+
+def _err(msg: str) -> None:
+    print(f"error: {msg}", file=sys.stderr)
+
+
+def _enumerate_targets(paths: list[Path]) -> list[tuple[str, Path]]:
+    """Expand a list of CLI paths into (kind, path) work items.
+
+    kind is either 'manifest' or 'index'. Manifests inside a referenced
+    index.json are appended after the index itself so output stays
+    grouped per-source.
+    """
+    out: list[tuple[str, Path]] = []
+    for p in paths:
+        if not p.exists():
+            _err(f"path not found: {p}")
+            sys.exit(2)
+        if p.is_dir():
+            found = sorted(
+                f for suffix in MANIFEST_SUFFIXES for f in p.rglob(f"*{suffix}")
+            )
+            if not found:
+                _err(f"no .yaml/.yml manifests under {p}")
+                sys.exit(2)
+            for f in found:
+                out.append(("manifest", f))
+        elif p.suffix == ".json":
+            out.append(("index", p))
+        elif p.suffix in MANIFEST_SUFFIXES:
+            out.append(("manifest", p))
+        else:
+            _err(
+                f"unrecognized path type {p} "
+                f"(want .yaml/.yml, .json, or a directory)"
+            )
+            sys.exit(2)
+    return out
+
+
+def _load_catalog_books(path: Path) -> list[dict]:
+    """Load Kiwix OPDS catalog snapshot. Accepts either the wrapped form
+    `{"books": [...]}` (matches /srv/prepperpi/cache/kiwix-catalog.json on
+    the appliance) or a bare list `[...]`."""
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if isinstance(data, dict) and isinstance(data.get("books"), list):
+        return data["books"]
+    if isinstance(data, list):
+        return data
+    raise ValueError(
+        f"{path}: catalog must be either a list of books or "
+        f"an object with a `books` array"
+    )
+
+
+def _load_regions_catalog(path: Path) -> dict:
+    """Load the regions catalog (regions.json from prepperpi-tiles)."""
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError(f"{path}: regions catalog must be a JSON object")
+    return data
+
+
+def _validate_manifest(
+    manifest_path: Path,
+    *,
+    source_id: str,
+    source_name: str,
+    catalog_books: list[dict] | None,
+    regions: dict | None,
+) -> list[str]:
+    """Return a list of error strings; empty list = clean."""
+    text = manifest_path.read_text(encoding="utf-8")
+    try:
+        bundle = bundles_schema.parse_manifest(
+            text, source_id=source_id, source_name=source_name
+        )
+    except bundles_schema.ManifestError as exc:
+        return [str(exc)]
+    if catalog_books is None and regions is None:
+        return []
+    bundles_schema.resolve_bundle(
+        bundle,
+        catalog_books=catalog_books or [],
+        region_catalog=regions or {},
+    )
+    return list(bundle.resolution_errors)
+
+
+def _resolve_index_target(index_path: Path, manifest_url: str) -> Path | None:
+    """Resolve an index entry's `url` to a local Path, if possible.
+
+    Local relative URLs work; absolute http(s) URLs aren't fetched (the
+    validator runs offline by design — fetch them yourself or run the
+    appliance to exercise the network path).
+    """
+    parsed = urlparse(manifest_url)
+    if parsed.scheme in ("http", "https"):
+        return None
+    return (index_path.parent / manifest_url).resolve()
+
+
+def _validate_index(
+    index_path: Path,
+    *,
+    catalog_books: list[dict] | None,
+    regions: dict | None,
+) -> tuple[int, int]:
+    """Validate an index.json + its referenced manifests. Returns
+    (ok_count, fail_count)."""
+    text = index_path.read_text(encoding="utf-8")
+    try:
+        source_name, entries = bundles_schema.parse_index(text)
+    except bundles_schema.ManifestError as exc:
+        print(f"[FAIL] {index_path}")
+        print(f"    {exc}")
+        return (0, 1)
+    print(f"[OK]   {index_path}  ({len(entries)} manifest(s))")
+    ok = fail = 0
+    for entry in entries:
+        target = _resolve_index_target(index_path, entry["url"])
+        if target is None:
+            print(
+                f"  [SKIP] {entry['id']} -> {entry['url']} "
+                f"(remote URL; run validator on the manifest file directly)"
+            )
+            continue
+        if not target.exists():
+            print(f"  [FAIL] {entry['id']} -> {target}")
+            print(f"    file not found: {target}")
+            fail += 1
+            continue
+        errors = _validate_manifest(
+            target,
+            source_id=index_path.stem,
+            source_name=source_name or index_path.stem,
+            catalog_books=catalog_books,
+            regions=regions,
+        )
+        if errors:
+            print(f"  [FAIL] {entry['id']} -> {target.name}")
+            for e in errors:
+                print(f"    {e}")
+            fail += 1
+        else:
+            print(f"  [OK]   {entry['id']} -> {target.name}")
+            ok += 1
+    return (ok, fail)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="bundles-validate",
+        description=(
+            "Validate PrepperPi bundle manifests against the appliance schema. "
+            "Accepts manifest YAML files, directories of manifests, or index.json files."
+        ),
+    )
+    parser.add_argument(
+        "paths",
+        nargs="+",
+        type=Path,
+        help="manifest YAML, directory of manifests, or index.json",
+    )
+    parser.add_argument(
+        "--catalog",
+        type=Path,
+        default=None,
+        help=(
+            "Kiwix catalog snapshot (JSON). With this set, validates that "
+            "every kind: zim book_id resolves against the snapshot."
+        ),
+    )
+    parser.add_argument(
+        "--regions",
+        type=Path,
+        default=None,
+        help=(
+            "regions.json snapshot. With this set, validates that every "
+            "kind: map_region region_id is in the catalog."
+        ),
+    )
+    args = parser.parse_args(argv)
+
+    catalog_books: list[dict] | None = None
+    regions: dict | None = None
+    try:
+        if args.catalog is not None:
+            catalog_books = _load_catalog_books(args.catalog)
+        if args.regions is not None:
+            regions = _load_regions_catalog(args.regions)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        _err(f"failed to load reference data: {exc}")
+        return 2
+
+    targets = _enumerate_targets(args.paths)
+
+    ok = fail = 0
+    for kind, path in targets:
+        if kind == "index":
+            tok, tfail = _validate_index(
+                path, catalog_books=catalog_books, regions=regions
+            )
+            ok += tok
+            fail += tfail
+            continue
+        try:
+            errors = _validate_manifest(
+                path,
+                source_id="validator",
+                source_name="validator",
+                catalog_books=catalog_books,
+                regions=regions,
+            )
+        except OSError as exc:
+            print(f"[FAIL] {path}")
+            print(f"    {exc}")
+            fail += 1
+            continue
+        if errors:
+            print(f"[FAIL] {path}")
+            for e in errors:
+                print(f"    {e}")
+            fail += 1
+        else:
+            print(f"[OK]   {path}")
+            ok += 1
+
+    total = ok + fail
+    print()
+    print(f"validated {total} manifest(s): {ok} OK, {fail} FAIL")
+    return 0 if fail == 0 else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
